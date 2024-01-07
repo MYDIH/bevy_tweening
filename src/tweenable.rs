@@ -250,8 +250,17 @@ impl<'a, T: Asset> Targetable<T> for AssetTarget<'a, T> {
     }
 }
 
+pub trait Oriented {
+    fn direction(&self) -> TweeningDirection;
+    fn set_direction(&mut self, direction: TweeningDirection);
+
+    fn half_turn(&mut self) {
+        self.set_direction(!self.direction())
+    }
+} 
+
 /// An animatable entity, either a single [`Tween`] or a collection of them.
-pub trait Tweenable<T>: Send + Sync {
+pub trait Tweenable<T>: Oriented + Send + Sync {
     /// Get the duration of a single iteration of the animation.
     ///
     /// Note that for [`RepeatStrategy::MirroredRepeat`], this is the duration
@@ -540,36 +549,11 @@ impl<T> Tween<T> {
 
     /// Set the playback direction of the tween.
     ///
-    /// The playback direction influences the mapping of the progress ratio (in
-    /// \[0:1\]) to the actual ratio passed to the lens.
-    /// [`TweeningDirection::Forward`] maps the `0` value of progress to the
-    /// `0` value of the lens ratio. Conversely, [`TweeningDirection::Backward`]
-    /// reverses the mapping, which effectively makes the tween play reversed,
-    /// going from end to start.
-    ///
-    /// Changing the direction doesn't change any target state, nor any progress
-    /// of the tween. Only the direction of animation from this moment
-    /// potentially changes. To force a target state change, call
-    /// [`Tweenable::tick()`] with a zero delta (`Duration::ZERO`).
-    pub fn set_direction(&mut self, direction: TweeningDirection) {
-        self.direction = direction;
-    }
-
-    /// Set the playback direction of the tween.
-    ///
     /// See [`Tween::set_direction()`].
     #[must_use]
     pub fn with_direction(mut self, direction: TweeningDirection) -> Self {
         self.direction = direction;
         self
-    }
-
-    /// The current animation direction.
-    ///
-    /// See [`TweeningDirection`] for details.
-    #[must_use]
-    pub fn direction(&self) -> TweeningDirection {
-        self.direction
     }
 
     /// Set the number of times to repeat the animation.
@@ -630,6 +614,33 @@ impl<T> Tween<T> {
     /// [`set_completed_event()`]: Tween::set_completed_event
     pub fn clear_completed_event(&mut self) {
         self.event_data = None;
+    }
+}
+
+impl<T> Oriented for Tween<T> {
+    /// The current animation direction.
+    ///
+    /// See [`TweeningDirection`] for details.
+    #[must_use]
+    fn direction(&self) -> TweeningDirection {
+        self.direction
+    }
+
+    /// Set the playback direction of the tween.
+    ///
+    /// The playback direction influences the mapping of the progress ratio (in
+    /// \[0:1\]) to the actual ratio passed to the lens.
+    /// [`TweeningDirection::Forward`] maps the `0` value of progress to the
+    /// `0` value of the lens ratio. Conversely, [`TweeningDirection::Backward`]
+    /// reverses the mapping, which effectively makes the tween play reversed,
+    /// going from end to start.
+    ///
+    /// Changing the direction doesn't change any target state, nor any progress
+    /// of the tween. Only the direction of animation from this moment
+    /// potentially changes. To force a target state change, call
+    /// [`Tweenable::tick()`] with a zero delta (`Duration::ZERO`).
+    fn set_direction(&mut self, direction: TweeningDirection) {
+        self.direction = direction;
     }
 }
 
@@ -721,9 +732,9 @@ impl<T> Tweenable<T> for Tween<T> {
 /// A sequence of tweens played back in order one after the other.
 pub struct Sequence<T> {
     tweens: Vec<BoxedTweenable<T>>,
+    direction: TweeningDirection,
+    clock: AnimClock,
     index: usize,
-    duration: Duration,
-    elapsed: Duration,
 }
 
 impl<T> Sequence<T> {
@@ -740,10 +751,10 @@ impl<T> Sequence<T> {
             .map(Tweenable::duration)
             .sum();
         Self {
-            tweens,
+            direction: TweeningDirection::Forward,
+            clock: AnimClock::new(duration),
             index: 0,
-            duration,
-            elapsed: Duration::ZERO,
+            tweens,
         }
     }
 
@@ -753,10 +764,10 @@ impl<T> Sequence<T> {
         let duration = tween.duration();
         let boxed: BoxedTweenable<T> = Box::new(tween);
         Self {
+            direction: TweeningDirection::Forward,
+            clock: AnimClock::new(duration),
             tweens: vec![boxed],
             index: 0,
-            duration,
-            elapsed: Duration::ZERO,
         }
     }
 
@@ -764,17 +775,31 @@ impl<T> Sequence<T> {
     #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
+            clock: AnimClock::new(Duration::ZERO),
+            direction: TweeningDirection::Forward,
             tweens: Vec::with_capacity(capacity),
             index: 0,
-            duration: Duration::ZERO,
-            elapsed: Duration::ZERO,
         }
+    }
+
+    /// Set the number of times to repeat the animation.
+    #[must_use]
+    pub fn with_repeat_count(mut self, count: impl Into<RepeatCount>) -> Self {
+        self.clock.total_duration = compute_total_duration(self.clock.duration, count.into());
+        self
+    }
+
+    /// Choose how the animation behaves upon a repetition.
+    #[must_use]
+    pub fn with_repeat_strategy(mut self, strategy: RepeatStrategy) -> Self {
+        self.clock.strategy = strategy;
+        self
     }
 
     /// Append a [`Tweenable`] to this sequence.
     #[must_use]
     pub fn then(mut self, tween: impl Tweenable<T> + 'static) -> Self {
-        self.duration += tween.duration();
+        self.clock.duration += tween.duration();
         self.tweens.push(Box::new(tween));
         self
     }
@@ -792,41 +817,58 @@ impl<T> Sequence<T> {
     }
 }
 
+impl<T> Oriented for Sequence<T> {
+    fn direction(&self) -> TweeningDirection {
+        self.direction
+    }
+
+    fn set_direction(&mut self, direction: TweeningDirection) {
+        self.direction = direction
+    }
+
+    fn half_turn(&mut self) {
+        self.set_direction(!self.direction());
+        for tween in self.tweens.iter_mut() {
+            tween.half_turn();
+        }
+    }
+}
+
 impl<T> Tweenable<T> for Sequence<T> {
     fn duration(&self) -> Duration {
-        self.duration
+        self.clock.duration
     }
 
     fn total_duration(&self) -> TotalDuration {
-        TotalDuration::Finite(self.duration)
+        self.clock.total_duration
     }
 
     fn set_elapsed(&mut self, elapsed: Duration) {
-        // Set the total sequence progress
-        self.elapsed = elapsed;
+       // Set the total sequence progress
+       self.clock.set_elapsed(elapsed);
 
-        // Find which tween is active in the sequence
-        let mut accum_duration = Duration::ZERO;
-        for index in 0..self.tweens.len() {
-            let tween = &mut self.tweens[index];
-            let tween_duration = tween.duration();
-            if elapsed < accum_duration + tween_duration {
-                self.index = index;
-                let local_duration = elapsed - accum_duration;
-                tween.set_elapsed(local_duration);
-                // TODO?? set progress of other tweens after that one to 0. ??
-                return;
-            }
-            tween.set_elapsed(tween.duration()); // ?? to prepare for next loop/rewind?
-            accum_duration += tween_duration;
-        }
+       // Find which tween is active in the sequence
+       let mut accum_duration = Duration::ZERO;
+       for index in 0..self.tweens.len() {
+           let tween = &mut self.tweens[index];
+           let tween_duration = tween.duration();
+           if elapsed < accum_duration + tween_duration {
+               self.index = index;
+               let local_duration = elapsed - accum_duration;
+               tween.set_elapsed(local_duration);
+               // TODO?? set progress of other tweens after that one to 0. ??
+               return;
+           }
+           tween.set_elapsed(tween.duration()); // ?? to prepare for next loop/rewind?
+           accum_duration += tween_duration;
+       }
 
-        // None found; sequence ended
-        self.index = self.tweens.len();
+       // None found; sequence ended
+       self.index = self.tweens.len();
     }
 
     fn elapsed(&self) -> Duration {
-        self.elapsed
+        self.clock.elapsed()
     }
 
     fn tick(
@@ -836,7 +878,10 @@ impl<T> Tweenable<T> for Sequence<T> {
         entity: Entity,
         events: &mut Mut<Events<TweenCompleted>>,
     ) -> TweenState {
-        self.elapsed = self.elapsed.saturating_add(delta).min(self.duration);
+        self.clock.tick(delta);
+
+        info!("index {}", self.index);
+
         while self.index < self.tweens.len() {
             let tween = &mut self.tweens[self.index];
             let tween_remaining = tween.duration() - tween.elapsed();
@@ -849,11 +894,13 @@ impl<T> Tweenable<T> for Sequence<T> {
             self.index += 1;
         }
 
+        // No active tween found, rewinding
+        self.rewind();
         TweenState::Completed
     }
 
     fn rewind(&mut self) {
-        self.elapsed = Duration::ZERO;
+        self.clock.set_elapsed(Duration::ZERO);
         self.index = 0;
         for tween in &mut self.tweens {
             // or only first?
@@ -865,6 +912,7 @@ impl<T> Tweenable<T> for Sequence<T> {
 /// A collection of [`Tweenable`] executing in parallel.
 pub struct Tracks<T> {
     tracks: Vec<BoxedTweenable<T>>,
+    direction: TweeningDirection,
     duration: Duration,
     elapsed: Duration,
 }
@@ -882,10 +930,21 @@ impl<T> Tracks<T> {
             .max()
             .unwrap();
         Self {
-            tracks,
-            duration,
+            direction: TweeningDirection::Forward,
             elapsed: Duration::ZERO,
+            duration,
+            tracks,
         }
+    }
+}
+
+impl<T> Oriented for Tracks<T> {
+    fn direction(&self) -> TweeningDirection {
+        self.direction
+    }
+
+    fn set_direction(&mut self, direction: TweeningDirection) {
+        self.direction = direction;
     }
 }
 
@@ -1103,6 +1162,12 @@ impl<T> Delay<T> {
     pub fn clear_completed_event(&mut self) {
         self.event_data = None;
     }
+}
+
+// Empty implementation, no point in storing Delay direction (I guess)
+impl<T> Oriented for Delay<T> {
+    fn direction(&self) -> TweeningDirection { TweeningDirection::Forward }
+    fn set_direction(&mut self, _: TweeningDirection) {}
 }
 
 impl<T> Tweenable<T> for Delay<T> {
@@ -1590,7 +1655,9 @@ mod tests {
                 end: Quat::from_rotation_x(90_f32.to_radians()),
             },
         );
-        let mut seq = tween1.then(tween2);
+        let mut seq = tween1
+            .then(tween2)
+            .with_repeat_strategy(RepeatStrategy::Repeat);
 
         let (mut world, entity) = make_test_env();
 
