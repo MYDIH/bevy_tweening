@@ -250,6 +250,7 @@ impl<'a, T: Asset> Targetable<T> for AssetTarget<'a, T> {
     }
 }
 
+/* implement https://stackoverflow.com/a/68719575 ? */
 pub trait Oriented {
     fn direction(&self) -> TweeningDirection;
     fn set_direction(&mut self, direction: TweeningDirection);
@@ -257,7 +258,7 @@ pub trait Oriented {
     fn half_turn(&mut self) {
         self.set_direction(!self.direction())
     }
-} 
+}
 
 /// An animatable entity, either a single [`Tween`] or a collection of them.
 pub trait Tweenable<T>: Oriented + Send + Sync {
@@ -681,7 +682,7 @@ impl<T> Tweenable<T> for Tween<T> {
         if self.clock.strategy == RepeatStrategy::MirroredRepeat
             && times_completed_for_direction & 1 != 0
         {
-            self.direction = !self.direction;
+            self.half_turn();
         }
 
         // Apply the lens, even if the animation finished, to ensure the state is
@@ -733,6 +734,7 @@ impl<T> Tweenable<T> for Tween<T> {
 pub struct Sequence<T> {
     tweens: Vec<BoxedTweenable<T>>,
     direction: TweeningDirection,
+    repeat_count: RepeatCount,
     clock: AnimClock,
     index: usize,
 }
@@ -751,7 +753,8 @@ impl<T> Sequence<T> {
             .map(Tweenable::duration)
             .sum();
         Self {
-            direction: TweeningDirection::Forward,
+            direction: TweeningDirection::default(),
+            repeat_count: RepeatCount::default(),
             clock: AnimClock::new(duration),
             index: 0,
             tweens,
@@ -764,7 +767,8 @@ impl<T> Sequence<T> {
         let duration = tween.duration();
         let boxed: BoxedTweenable<T> = Box::new(tween);
         Self {
-            direction: TweeningDirection::Forward,
+            direction: TweeningDirection::default(),
+            repeat_count: RepeatCount::default(),
             clock: AnimClock::new(duration),
             tweens: vec![boxed],
             index: 0,
@@ -776,8 +780,9 @@ impl<T> Sequence<T> {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             clock: AnimClock::new(Duration::ZERO),
-            direction: TweeningDirection::Forward,
+            direction: TweeningDirection::default(),
             tweens: Vec::with_capacity(capacity),
+            repeat_count: RepeatCount::default(),
             index: 0,
         }
     }
@@ -785,7 +790,8 @@ impl<T> Sequence<T> {
     /// Set the number of times to repeat the animation.
     #[must_use]
     pub fn with_repeat_count(mut self, count: impl Into<RepeatCount>) -> Self {
-        self.clock.total_duration = compute_total_duration(self.clock.duration, count.into());
+        self.repeat_count = count.into();
+        self.clock.total_duration = compute_total_duration(self.clock.duration, self.repeat_count);
         self
     }
 
@@ -800,6 +806,7 @@ impl<T> Sequence<T> {
     #[must_use]
     pub fn then(mut self, tween: impl Tweenable<T> + 'static) -> Self {
         self.clock.duration += tween.duration();
+        self.clock.total_duration = compute_total_duration(self.clock.duration, self.repeat_count);
         self.tweens.push(Box::new(tween));
         self
     }
@@ -807,7 +814,12 @@ impl<T> Sequence<T> {
     /// Index of the current active tween in the sequence.
     #[must_use]
     pub fn index(&self) -> usize {
-        self.index.min(self.tweens.len() - 1)
+        match self.direction {
+            TweeningDirection::Forward => self.index.min(self.tweens.len() - 1),
+            TweeningDirection::Backward => {
+                self.tweens.len() - self.index.min(self.tweens.len()) - 1
+            }
+        }
     }
 
     /// Get the current active tween in the sequence.
@@ -825,13 +837,6 @@ impl<T> Oriented for Sequence<T> {
     fn set_direction(&mut self, direction: TweeningDirection) {
         self.direction = direction
     }
-
-    fn half_turn(&mut self) {
-        self.set_direction(!self.direction());
-        for tween in self.tweens.iter_mut() {
-            tween.half_turn();
-        }
-    }
 }
 
 impl<T> Tweenable<T> for Sequence<T> {
@@ -844,27 +849,27 @@ impl<T> Tweenable<T> for Sequence<T> {
     }
 
     fn set_elapsed(&mut self, elapsed: Duration) {
-       // Set the total sequence progress
-       self.clock.set_elapsed(elapsed);
+        // Set the total sequence progress
+        self.clock.set_elapsed(elapsed);
 
-       // Find which tween is active in the sequence
-       let mut accum_duration = Duration::ZERO;
-       for index in 0..self.tweens.len() {
-           let tween = &mut self.tweens[index];
-           let tween_duration = tween.duration();
-           if elapsed < accum_duration + tween_duration {
-               self.index = index;
-               let local_duration = elapsed - accum_duration;
-               tween.set_elapsed(local_duration);
-               // TODO?? set progress of other tweens after that one to 0. ??
-               return;
-           }
-           tween.set_elapsed(tween.duration()); // ?? to prepare for next loop/rewind?
-           accum_duration += tween_duration;
-       }
+        // Find which tween is active in the sequence
+        let mut accum_duration = Duration::ZERO;
+        for index in 0..self.tweens.len() {
+            let tween = &mut self.tweens[index];
+            let tween_duration = tween.duration();
+            if elapsed < accum_duration + tween_duration {
+                self.index = index;
+                let local_duration = elapsed - accum_duration;
+                tween.set_elapsed(local_duration);
+                // TODO?? set progress of other tweens after that one to 0. ??
+                return;
+            }
+            tween.set_elapsed(tween.duration()); // ?? to prepare for next loop/rewind?
+            accum_duration += tween_duration;
+        }
 
-       // None found; sequence ended
-       self.index = self.tweens.len();
+        // None found; sequence ended
+        self.index = self.tweens.len();
     }
 
     fn elapsed(&self) -> Duration {
@@ -878,30 +883,44 @@ impl<T> Tweenable<T> for Sequence<T> {
         entity: Entity,
         events: &mut Mut<Events<TweenCompleted>>,
     ) -> TweenState {
-        self.clock.tick(delta);
+        if self.clock.state() == TweenState::Completed {
+            return TweenState::Completed;
+        }
 
-        info!("index {}", self.index);
+        let (state, times_completed) = self.clock.tick(delta);
+        let times_completed_for_direction = match state {
+            TweenState::Completed => times_completed.max(1) - 1, // ignore last
+            TweenState::Active => times_completed,
+        };
+        if times_completed_for_direction & 1 != 0 {
+            if self.clock.strategy == RepeatStrategy::MirroredRepeat {
+                self.half_turn();
+                info!("inverted");
+            }
+            self.rewind();
+        }
 
         while self.index < self.tweens.len() {
-            let tween = &mut self.tweens[self.index];
+            let current_index = self.index();
+            let tween = &mut self.tweens[current_index];
+            let direct = tween.direction();
+            info!("{}, {}", self.index, current_index);
+            info!("tween direction {:?}", direct);
             let tween_remaining = tween.duration() - tween.elapsed();
             if let TweenState::Active = tween.tick(delta, target, entity, events) {
                 return TweenState::Active;
             }
 
-            tween.rewind();
             delta -= tween_remaining;
             self.index += 1;
+            tween.rewind();
         }
-
-        // No active tween found, rewinding
-        self.rewind();
-        TweenState::Completed
+        state
     }
 
     fn rewind(&mut self) {
-        self.clock.set_elapsed(Duration::ZERO);
         self.index = 0;
+        info!("rewind");
         for tween in &mut self.tweens {
             // or only first?
             tween.rewind();
@@ -1166,7 +1185,9 @@ impl<T> Delay<T> {
 
 // Empty implementation, no point in storing Delay direction (I guess)
 impl<T> Oriented for Delay<T> {
-    fn direction(&self) -> TweeningDirection { TweeningDirection::Forward }
+    fn direction(&self) -> TweeningDirection {
+        TweeningDirection::Forward
+    }
     fn set_direction(&mut self, _: TweeningDirection) {}
 }
 

@@ -134,10 +134,13 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
                     end: pair[1] - center,
                 },
             )
+            .with_repeat_strategy(RepeatStrategy::MirroredRepeat)
             // Get an event after each segment
             .with_completed_event(index as u64),
         ])
-    }));
+    }))
+    .with_repeat_count(RepeatCount::Finite(2))
+    .with_repeat_strategy(RepeatStrategy::MirroredRepeat);
 
     commands.spawn((
         SpriteBundle {
